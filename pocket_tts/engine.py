@@ -16,79 +16,57 @@ def natural_sort_key(s):
         for text in re.split("([0-9]+)", s)
     ]
 
-
 class StatefulRunner:
     def __init__(self, session: ort.InferenceSession):
         self.session = session
-        self.state = {}
+        self.input_feed = {}
 
-        # Collect and sort all state names numerically
-        self.input_names = [i.name for i in self.session.get_inputs()]
-        self.state_inputs = sorted(
-            [n for n in self.input_names if n.startswith("state_")],
-            key=natural_sort_key,
-        )
+        # Pre-calculate indices and names
+        inputs = self.session.get_inputs()
+        outputs = self.session.get_outputs()
 
-        self.output_names = [o.name for o in self.session.get_outputs()]
-        self.state_outputs = sorted(
-            [n for n in self.output_names if n.startswith("out_state_")],
-            key=natural_sort_key,
-        )
+        self.state_inputs = sorted([n.name for n in inputs if n.name.startswith("state_")], key=natural_sort_key)
+        self.state_outputs = sorted([n.name for n in outputs if n.name.startswith("out_state_")], key=natural_sort_key)
 
-        # Primary inputs (latent, conditioner, etc.)
-        self.non_state_inputs = [
-            n for n in self.input_names if not n.startswith("state_")
+        # Map state output index to input name for fast updates
+        output_names = [o.name for o in outputs]
+        self.state_mapping = [
+            (output_names.index(out_n), in_n)
+            for out_n, in_n in zip(self.state_outputs, self.state_inputs)
         ]
 
+        self.non_state_inputs = [n.name for n in inputs if not n.name.startswith("state_")]
+        self.reset_state()
+
     def reset_state(self):
-        """Initializes all states with the correct dtype and shape."""
-        self.state.clear()
+        self.input_feed.clear()
         for node in self.session.get_inputs():
-            if node.name.startswith("state_"):
-                # Handle dynamic shapes: if dim is -1/None/0, use 0 (empty sequence)
-                shape = [d if (isinstance(d, int) and d > 0) else 0 for d in node.shape]
-
-                # Match ONNX types to NumPy types
-                if "float" in node.type:
-                    dtype = np.float32
-                elif "bool" in node.type:
-                    dtype = bool  # Fixes the tensor(bool) error
-                elif "int64" in node.type:
-                    dtype = np.int64
-                else:
-                    dtype = np.float32
-
-                self.state[node.name] = np.zeros(shape, dtype=dtype)
+            shape = [d if (isinstance(d, int) and d > 0) else 0 for d in node.shape]
+            dtype = np.float32 if 'float' in node.type else (bool if 'bool' in node.type else np.int64)
+            self.input_feed[node.name] = np.zeros(shape, dtype=dtype)
 
     def run(self, inputs: dict) -> list[np.ndarray]:
-        # Merge the user provided inputs with the internal KV cache/states
-        run_inputs = {**inputs, **self.state}
+        # In-place update (no new dict created)
+        for k, v in inputs.items():
+            self.input_feed[k] = v
 
-        # Run inference
-        outputs = self.session.run(None, run_inputs)
-        out_dict = dict(zip(self.output_names, outputs))
+        outputs = self.session.run(None, self.input_feed)
 
-        # Update the state store with the NEW states returned by the model
-        for out_name, in_name in zip(self.state_outputs, self.state_inputs):
-            self.state[in_name] = out_dict[out_name]
+        # Update states in-place for next frame
+        for out_idx, in_name in self.state_mapping:
+            self.input_feed[in_name] = outputs[out_idx]
 
         return outputs
 
-
 class LatentGen:
-    def __init__(
-        self,
-        main_runner: StatefulRunner,
-        txt_sess: ort.InferenceSession,
-        flow_sess: ort.InferenceSession,
-        voice_emb: np.ndarray,
-        tokens: np.ndarray,
-        config: Config,
-    ):
+    def __init__(self, main_runner: StatefulRunner, txt_sess: ort.InferenceSession,
+                 flow_sess: ort.InferenceSession, voice_emb: np.ndarray,
+                 tokens: np.ndarray, config: Config):
         self.main = main_runner
         self.flow = flow_sess
         self.config = config
 
+        # Pre-calculate constants for the flow matching loop
         self.dt = np.float32(1.0 / config.lsd_steps)
         self.st_values = [
             (np.float32(j * self.dt), np.float32((j + 1) * self.dt))
@@ -96,53 +74,59 @@ class LatentGen:
         ]
         self.temp = np.float32(np.sqrt(config.temperature))
 
+        # Pre-allocate noise buffer to avoid calling np.random in the hot loop
+        # 2000 frames covers ~16 seconds of audio, enough for most sentences.
+        self.noise_ptr = 0
+        self.noise_buffer = np.random.randn(2000, 32).astype(np.float32)
+        if config.noise_clamp > 0:
+            np.clip(self.noise_buffer, -config.noise_clamp, config.noise_clamp, out=self.noise_buffer)
+        self.noise_buffer *= self.temp
+
+        # Pre-allocate static empty conditioner for the next() AR steps
+        self.empty_cond = np.zeros((1, 0, 1024), dtype=np.float32)
+
+        # Internal state tracking
         self.done = False
         self.eos_detected = False
         self.extra_frames_count = 0
 
-        # NaN is used by the model as a start-of-sequence marker
+        # Initialize cl (current latent) with NaN as the Start-of-Sequence marker
         self.cl = np.full((1, 1, 32), np.nan, dtype=np.float32)
 
+        # 1. Reset the Transformer KV cache/states
         self.main.reset_state()
 
-        # 1. Generate text embedding
+        # 2. Generate the text conditioning embedding
         txt_in_name = txt_sess.get_inputs()[0].name
         temb = txt_sess.run(None, {txt_in_name: tokens.astype(np.int64)})[0]
 
-        # 2. Conditioning: Voice Pass then Text Pass
-        # These prime the KV cache with context from the voice and text
+        # 3. Conditioning Passes (The "Priming" phase)
+        # We pass an empty sequence for the latents and the real context for conditioning
         empty_seq = np.zeros((1, 0, 32), dtype=np.float32)
 
-        # Pass Voice
-        self.main.run(
-            {
-                self.main.non_state_inputs[0]: empty_seq,
-                self.main.non_state_inputs[1]: voice_emb.astype(np.float32),
-            }
-        )
-        # Pass Text
-        self.main.run(
-            {
-                self.main.non_state_inputs[0]: empty_seq,
-                self.main.non_state_inputs[1]: temb.astype(np.float32),
-            }
-        )
+        # Pass 1: Voice Conditioning
+        self.main.run({
+            self.main.non_state_inputs[0]: empty_seq,
+            self.main.non_state_inputs[1]: voice_emb.astype(np.float32)
+        })
+
+        # Pass 2: Text Conditioning
+        self.main.run({
+            self.main.non_state_inputs[0]: empty_seq,
+            self.main.non_state_inputs[1]: temb.astype(np.float32)
+        })
 
     def next(self) -> np.ndarray | None:
-        if self.done:
-            return None
+        if self.done: return None
 
-        # AR Step
-        inputs = {
+        # 1. Main LM Step - Use pre-allocated empty_cond
+        outputs = self.main.run({
             self.main.non_state_inputs[0]: self.cl,
-            self.main.non_state_inputs[1]: np.zeros((1, 0, 1024), dtype=np.float32),
-        }
-        outputs = self.main.run(inputs)
+            self.main.non_state_inputs[1]: self.empty_cond
+        })
 
         cond = outputs[0]
-        eos_logit = outputs[1].flatten()[0]
-
-        if not self.eos_detected and eos_logit > self.config.eos_threshold:
+        if not self.eos_detected and outputs[1].flatten()[0] > self.config.eos_threshold:
             self.eos_detected = True
 
         if self.eos_detected:
@@ -151,28 +135,24 @@ class LatentGen:
                 self.done = True
                 return None
 
-        # Flow Step (Refinement)
-        if self.temp > 0:
-            fx = np.random.randn(1, 32).astype(np.float32) * self.temp
-            if self.config.noise_clamp > 0:
-                fx = np.clip(fx, -self.config.noise_clamp, self.config.noise_clamp)
-        else:
-            fx = np.zeros((1, 32), dtype=np.float32)
+        # 2. Flow Matching - Use pre-sampled noise
+        fx = self.noise_buffer[self.noise_ptr : self.noise_ptr + 1]
+        self.noise_ptr = (self.noise_ptr + 1) % 2000
 
         flow_inputs = [i.name for i in self.flow.get_inputs()]
         for s, t in self.st_values:
-            f_in = {
+            # We must use dict here because ORT requires it, but we can reuse the keys
+            f_out = self.flow.run(None, {
                 flow_inputs[0]: cond,
                 flow_inputs[1]: np.array([[s]], dtype=np.float32),
                 flow_inputs[2]: np.array([[t]], dtype=np.float32),
-                flow_inputs[3]: fx,
-            }
-            out_f = cast(np.ndarray, self.flow.run(None, f_in)[0])
-            fx = (fx + out_f * self.dt).astype(np.float32)
+                flow_inputs[3]: fx
+            })[0]
+            # Use += to update in-place
+            fx = fx + (f_out * self.dt)
 
         self.cl = fx.reshape(1, 1, 32)
-        return self.cl.copy()
-
+        return self.cl
 
 class PocketTTS:
     def __init__(self, config: Config = Config()):

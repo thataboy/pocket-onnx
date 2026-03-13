@@ -21,10 +21,10 @@ def main():
     output_raw_path = "output.pcm"
 
     # --- 1) Voice Cloning (Load model state from WAV sample) ---
-    print(f"Encoding voice from {voice_sample_path}...")
-    voice_emb = tts.encode_voice(voice_sample_path)
-    PocketTTS.export_voice(voice_emb, "matthew")
-    voice_emb = PocketTTS.import_voice("matthew.npy")
+    # print(f"Encoding voice from {voice_sample_path}...")
+    # voice_emb = tts.encode_voice(voice_sample_path)
+    # PocketTTS.export_voice(voice_emb, "matthew")
+    voice_emb = PocketTTS.import_voice("narrator.npy")
     
     # --- 2) Stream raw PCM s16le (Suitable for streaming/sockets) ---
     # print(f"Streaming raw PCM data to {output_raw_path}...")
