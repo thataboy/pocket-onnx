@@ -1,0 +1,26 @@
+[project]
+name = "pocket-tts-onnx"
+version = "0.1.0"
+description = "Python implementation of the PocketTTS ONNX runtime"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "onnxruntime>=1.17.0",
+    "numpy>=1.24.0",
+    "sentencepiece>=0.1.99",
+    "soundfile>=0.12.1",
+    "librosa>=0.10.1",
+    "scipy>=1.11.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+# Optimization: if you have an NVIDIA GPU, you can uncomment the line below 
+# to use the GPU-accelerated runtime instead of the CPU one.
+# override-dependencies = ["onnxruntime-gpu>=1.17.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pocket_tts"]
