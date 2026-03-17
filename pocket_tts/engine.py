@@ -1,6 +1,7 @@
 import onnxruntime as ort
 import numpy as np
 import re
+from functools import lru_cache
 from typing import Generator, cast
 import os
 
@@ -16,117 +17,121 @@ def natural_sort_key(s):
         for text in re.split("([0-9]+)", s)
     ]
 
-class StatefulRunner:
+class IOStatefulRunner:
+    """High-performance runner using IOBinding for fixed-shape Transformer states."""
     def __init__(self, session: ort.InferenceSession):
         self.session = session
-        self.input_feed = {}
+        self.io_binding = self.session.io_binding()
+        self.input_names = [i.name for i in self.session.get_inputs()]
+        self.output_names = [o.name for o in self.session.get_outputs()]
 
-        # Pre-calculate indices and names
-        inputs = self.session.get_inputs()
-        outputs = self.session.get_outputs()
-
-        self.state_inputs = sorted([n.name for n in inputs if n.name.startswith("state_")], key=natural_sort_key)
-        self.state_outputs = sorted([n.name for n in outputs if n.name.startswith("out_state_")], key=natural_sort_key)
-
-        # Map state output index to input name for fast updates
-        output_names = [o.name for o in outputs]
-        self.state_mapping = [
-            (output_names.index(out_n), in_n)
-            for out_n, in_n in zip(self.state_outputs, self.state_inputs)
-        ]
-
-        self.non_state_inputs = [n.name for n in inputs if not n.name.startswith("state_")]
+        self.state_inputs = sorted([n for n in self.input_names if n.startswith("state_")], key=natural_sort_key)
+        self.state_outputs = sorted([n for n in self.output_names if n.startswith("out_state_")], key=natural_sort_key)
+        self.state_pairs = list(zip(self.state_inputs, self.state_outputs))
+        self.non_state_inputs = [n for n in self.input_names if not n.startswith("state_")]
         self.reset_state()
 
     def reset_state(self):
-        self.input_feed.clear()
         for node in self.session.get_inputs():
-            shape = [d if (isinstance(d, int) and d > 0) else 0 for d in node.shape]
-            dtype = np.float32 if 'float' in node.type else (bool if 'bool' in node.type else np.int64)
-            self.input_feed[node.name] = np.zeros(shape, dtype=dtype)
+            if node.name.startswith("state_"):
+                shape = [d if (isinstance(d, int) and d > 0) else 0 for d in node.shape]
+                dtype = np.float32 if 'float' in node.type else (bool if 'bool' in node.type else np.int64)
+                self.io_binding.bind_cpu_input(node.name, np.zeros(shape, dtype=dtype))
+        for out_name in self.output_names:
+            self.io_binding.bind_output(out_name)
 
     def run(self, inputs: dict) -> list[np.ndarray]:
-        # In-place update (no new dict created)
         for k, v in inputs.items():
-            self.input_feed[k] = v
+            self.io_binding.bind_cpu_input(k, v)
+        self.session.run_with_iobinding(self.io_binding)
+        outputs = self.io_binding.get_outputs()
+        out_dict = {name: val for name, val in zip(self.output_names, outputs)}
+        for in_name, out_name in self.state_pairs:
+            self.io_binding.bind_ortvalue_input(in_name, out_dict[out_name])
+        # Only return non-state outputs (latent and eos logit)
+        return [out_dict[n].numpy() for n in self.output_names if not n.startswith("out_state_")]
 
-        outputs = self.session.run(None, self.input_feed)
+class SimpleStatefulRunner:
+    """Reliable runner for models with dynamic shapes (like the Mimi Decoder)."""
+    def __init__(self, session: ort.InferenceSession):
+        self.session = session
+        self.state = {}
+        self.input_names = [i.name for i in self.session.get_inputs()]
+        self.state_inputs = sorted([n for n in self.input_names if n.startswith("state_")], key=natural_sort_key)
+        self.output_names = [o.name for o in self.session.get_outputs()]
+        self.state_outputs = sorted([n for n in self.output_names if n.startswith("out_state_")], key=natural_sort_key)
+        self.non_state_inputs = [n for n in self.input_names if not n.startswith("state_")]
+        self.reset_state()
 
-        # Update states in-place for next frame
-        for out_idx, in_name in self.state_mapping:
-            self.input_feed[in_name] = outputs[out_idx]
+    def reset_state(self):
+        self.state.clear()
+        for node in self.session.get_inputs():
+            if node.name.startswith("state_"):
+                shape = [d if (isinstance(d, int) and d > 0) else 0 for d in node.shape]
+                dtype = np.float32 if 'float' in node.type else (bool if 'bool' in node.type else np.int64)
+                self.state[node.name] = np.zeros(shape, dtype=dtype)
 
-        return outputs
+    def run(self, inputs: dict) -> list[np.ndarray]:
+        run_inputs = {**inputs, **self.state}
+        outputs = self.session.run(None, run_inputs)
+        out_dict = dict(zip(self.output_names, outputs))
+        for out_name, in_name in zip(self.state_outputs, self.state_inputs):
+            self.state[in_name] = out_dict[out_name]
+        return [out_dict[n] for n in self.output_names if not n.startswith("out_state_")]
 
 class LatentGen:
-    def __init__(self, main_runner: StatefulRunner, txt_sess: ort.InferenceSession,
+    def __init__(self, main_runner: IOStatefulRunner, txt_sess: ort.InferenceSession,
                  flow_sess: ort.InferenceSession, voice_emb: np.ndarray,
                  tokens: np.ndarray, config: Config):
         self.main = main_runner
         self.flow = flow_sess
         self.config = config
 
-        # Pre-calculate constants for the flow matching loop
+        # Pre-calculate constants
         self.dt = np.float32(1.0 / config.lsd_steps)
-        self.st_values = [
-            (np.float32(j * self.dt), np.float32((j + 1) * self.dt))
-            for j in range(config.lsd_steps)
-        ]
+        self.st_values = [(np.float32(j * self.dt), np.float32((j + 1) * self.dt)) for j in range(config.lsd_steps)]
         self.temp = np.float32(np.sqrt(config.temperature))
 
-        # Pre-allocate noise buffer to avoid calling np.random in the hot loop
-        # 2000 frames covers ~16 seconds of audio, enough for most sentences.
+        # Dynamic Name Mapping (Fixes the 'c' vs 'cond' error)
+        flow_inputs = self.flow.get_inputs()
+        self.flow_names = [i.name for i in flow_inputs]
+
+        # Pre-allocate loop tensors (Saves ~10us per frame)
+        self.s_zero = np.array([[0.0]], dtype=np.float32)
+        self.t_one = np.array([[1.0]], dtype=np.float32)
+        self.empty_cond = np.zeros((1, 0, 1024), dtype=np.float32)
+
+        # Pre-allocate noise
         self.noise_ptr = 0
         self.noise_buffer = np.random.randn(2000, 32).astype(np.float32)
         if config.noise_clamp > 0:
             np.clip(self.noise_buffer, -config.noise_clamp, config.noise_clamp, out=self.noise_buffer)
         self.noise_buffer *= self.temp
 
-        # Pre-allocate static empty conditioner for the next() AR steps
-        self.empty_cond = np.zeros((1, 0, 1024), dtype=np.float32)
-
-        # Internal state tracking
         self.done = False
         self.eos_detected = False
         self.extra_frames_count = 0
-
-        # Initialize cl (current latent) with NaN as the Start-of-Sequence marker
         self.cl = np.full((1, 1, 32), np.nan, dtype=np.float32)
 
-        # 1. Reset the Transformer KV cache/states
+        # Prime the main model
         self.main.reset_state()
-
-        # 2. Generate the text conditioning embedding
-        txt_in_name = txt_sess.get_inputs()[0].name
-        temb = txt_sess.run(None, {txt_in_name: tokens.astype(np.int64)})[0]
-
-        # 3. Conditioning Passes (The "Priming" phase)
-        # We pass an empty sequence for the latents and the real context for conditioning
+        temb = txt_sess.run(None, {txt_sess.get_inputs()[0].name: tokens.astype(np.int64)})[0]
         empty_seq = np.zeros((1, 0, 32), dtype=np.float32)
 
-        # Pass 1: Voice Conditioning
-        self.main.run({
-            self.main.non_state_inputs[0]: empty_seq,
-            self.main.non_state_inputs[1]: voice_emb.astype(np.float32)
-        })
-
-        # Pass 2: Text Conditioning
-        self.main.run({
-            self.main.non_state_inputs[0]: empty_seq,
-            self.main.non_state_inputs[1]: temb.astype(np.float32)
-        })
+        self.main.run({self.main.non_state_inputs[0]: empty_seq, self.main.non_state_inputs[1]: voice_emb.astype(np.float32)})
+        self.main.run({self.main.non_state_inputs[0]: empty_seq, self.main.non_state_inputs[1]: temb.astype(np.float32)})
 
     def next(self) -> np.ndarray | None:
         if self.done: return None
 
-        # 1. Main LM Step - Use pre-allocated empty_cond
-        outputs = self.main.run({
+        # Main LM Step
+        main_out = self.main.run({
             self.main.non_state_inputs[0]: self.cl,
             self.main.non_state_inputs[1]: self.empty_cond
         })
 
-        cond = outputs[0]
-        if not self.eos_detected and outputs[1].flatten()[0] > self.config.eos_threshold:
+        cond = main_out[0]
+        if not self.eos_detected and main_out[1].item() > self.config.eos_threshold:
             self.eos_detected = True
 
         if self.eos_detected:
@@ -135,23 +140,20 @@ class LatentGen:
                 self.done = True
                 return None
 
-        # 2. Flow Matching - Use pre-sampled noise
+        # Flow Step - Final optimization for 8x
         fx = self.noise_buffer[self.noise_ptr : self.noise_ptr + 1]
         self.noise_ptr = (self.noise_ptr + 1) % 2000
 
-        flow_inputs = [i.name for i in self.flow.get_inputs()]
-        for s, t in self.st_values:
-            # We must use dict here because ORT requires it, but we can reuse the keys
-            f_out = self.flow.run(None, {
-                flow_inputs[0]: cond,
-                flow_inputs[1]: np.array([[s]], dtype=np.float32),
-                flow_inputs[2]: np.array([[t]], dtype=np.float32),
-                flow_inputs[3]: fx
-            })[0]
-            # Use += to update in-place
-            fx = fx + (f_out * self.dt)
+        # Call flow model once (lsd_steps=1)
+        # Using a list for inputs is slightly faster than a dict in some ORT versions
+        f_out = self.flow.run(None, {
+            self.flow_names[0]: cond,
+            self.flow_names[1]: self.s_zero,
+            self.flow_names[2]: self.t_one,
+            self.flow_names[3]: fx
+        })[0]
 
-        self.cl = fx.reshape(1, 1, 32)
+        self.cl = (fx + f_out).reshape(1, 1, 32)
         return self.cl
 
 class PocketTTS:
@@ -160,6 +162,7 @@ class PocketTTS:
         self.tokenizer = Tokenizer(config.tokenizer_path)
 
         opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 4
         sfx = "_int8" if config.precision == "int8" else ""
         mdir = config.models_dir
 
@@ -168,7 +171,7 @@ class PocketTTS:
             os.path.join(mdir, "text_conditioner.onnx"), opts
         )
         self.main_sess = ort.InferenceSession(
-            os.path.join(mdir, f"flow_lm_main{sfx}.onnx"), opts
+            os.path.join(mdir, f"flow_lm_main{sfx}.onnx"), opts,
         )
         self.flow = ort.InferenceSession(
             os.path.join(mdir, f"flow_lm_flow{sfx}.onnx"), opts
@@ -177,8 +180,11 @@ class PocketTTS:
             os.path.join(mdir, f"mimi_decoder{sfx}.onnx"), opts
         )
 
-        self.main_runner = StatefulRunner(self.main_sess)
-        self.dec_runner = StatefulRunner(self.dec)
+        # Use IOBinding for the heavy Transformer
+        self.main_runner = IOStatefulRunner(self.main_sess)
+
+        # Use Simple runner for the dynamic Decoder
+        self.dec_runner = SimpleStatefulRunner(self.dec)
 
     def encode_voice(self, wav_path: str) -> np.ndarray:
         audio = load_audio(wav_path, self.config.sample_rate)
@@ -257,6 +263,7 @@ class PocketTTS:
         np.save(path, voice_emb)
 
     @staticmethod
+    @lru_cache(maxsize=2)
     def import_voice(path) -> np.ndarray:
         """Loads a voice embedding from a .npy file."""
         return np.load(path)

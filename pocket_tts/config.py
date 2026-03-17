@@ -10,6 +10,6 @@ class Config:
     noise_clamp: float = 3.0
     lsd_steps: int = 1
     first_chunk_frames: int = 1
-    max_chunk_frames: int = 15
+    max_chunk_frames: int = 31
     eos_extra_frames: int = 10
     sample_rate: int = 24000
