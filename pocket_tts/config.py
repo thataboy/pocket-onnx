@@ -11,5 +11,5 @@ class Config:
     lsd_steps: int = 1
     first_chunk_frames: int = 1
     max_chunk_frames: int = 31
-    eos_extra_frames: int = 10
+    eos_extra_frames: int = 2
     sample_rate: int = 24000

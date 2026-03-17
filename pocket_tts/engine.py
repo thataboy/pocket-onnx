@@ -2,6 +2,7 @@ import onnxruntime as ort
 import numpy as np
 import re
 from functools import lru_cache
+from pathlib import Path
 from typing import Generator, cast
 import os
 
@@ -186,7 +187,7 @@ class PocketTTS:
         # Use Simple runner for the dynamic Decoder
         self.dec_runner = SimpleStatefulRunner(self.dec)
 
-    def encode_voice(self, wav_path: str) -> np.ndarray:
+    def encode_voice(self, wav_path: str | Path) -> np.ndarray:
         audio = load_audio(wav_path, self.config.sample_rate)
         audio_tensor = audio[np.newaxis, np.newaxis, :].astype(np.float32)
         enc_in = self.enc.get_inputs()[0].name
@@ -197,7 +198,7 @@ class PocketTTS:
             voice_emb = np.expand_dims(voice_emb, axis=0)
         return voice_emb.astype(np.float32)
 
-    def stream_raw_pcm(
+    def stream(
         self, text: str, voice_emb: np.ndarray
     ) -> Generator[bytes, None, None]:
         sentences = split_sentences(text)
@@ -251,7 +252,7 @@ class PocketTTS:
 
     def generate(self, text: str, voice_emb: np.ndarray) -> np.ndarray:
         all_chunks = []
-        for pcm_bytes in self.stream_raw_pcm(text, voice_emb):
+        for pcm_bytes in self.stream(text, voice_emb):
             all_chunks.append(np.frombuffer(pcm_bytes, dtype=np.int16))
         return (
             np.concatenate(all_chunks) if all_chunks else np.array([], dtype=np.int16)

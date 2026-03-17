@@ -1,8 +1,9 @@
 import numpy as np
 import soundfile as sf
 import librosa
+from pathlib import Path
 
-def load_audio(path: str, target_sr: int = 24000) -> np.ndarray:
+def load_audio(path: str | Path, target_sr: int = 24000) -> np.ndarray:
     """Loads an audio file, mixes to mono, resamples, and normalizes."""
     y, sr = sf.read(path, always_2d=True)
     y = y.mean(axis=1)  # Mix to mono
